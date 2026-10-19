@@ -14,8 +14,14 @@ import {
   checkIfFollowing,
   getRecommendations,
   getUserStats,
+  getLearningDashboard,
 } from "../controllers/userController.js";
 import { searchAll } from "../controllers/searchController.js";
+import { getUserBadgesController } from "../controllers/badge.controller.js";
+import completionRoutes, {
+  getUserCompletion,
+} from "./api/users/completion.js";
+import preferencesRoutes from "./api/users/preferences.js";
 import {
   cacheMiddleware,
   invalidateCacheMiddleware,
@@ -31,6 +37,10 @@ const followersCacheKey = (req) =>
   `${CACHE_KEYS.USER}${req.params.userId}:followers`;
 const followingCacheKey = (req) =>
   `${CACHE_KEYS.USER}${req.params.userId}:following`;
+
+// User preferences routes (must be before /:id)
+router.use("/me/preferences", preferencesRoutes);
+router.use("/preferences", preferencesRoutes);
 
 // Get personalized recommendations - cached for 10 minutes (must be before /:id)
 router.get(
@@ -56,6 +66,15 @@ router.put(
   invalidateCacheMiddleware([`${CACHE_KEYS.USER}*`]),
   updateUser
 );
+
+// Profile completion routes (must be before /:id)
+router.use("/completion", completionRoutes);
+
+// Fetch user badges
+router.get("/:userId/badges", protect, getUserBadgesController);
+
+// Fetch user profile completion
+router.get("/:userId/completion", protect, getUserCompletion);
 
 // Get user by ID - cached for 10 minutes
 router.get(
@@ -131,5 +150,6 @@ router.get(
   cacheMiddleware(CACHE_TTL.USERS, userStatsCacheKey),
   getUserStats
 );
+router.get("/me/learning", protect, getLearningDashboard);
 
 export default router;

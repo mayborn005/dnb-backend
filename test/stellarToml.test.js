@@ -138,6 +138,32 @@ describe("GET /.well-known/stellar.toml", () => {
     });
   });
 
+  it("emits SCHOLARSHIP_ESCROW_CONTRACT only for a valid Soroban contract id (C...)", async () => {
+    const validContract = "CBP3UFPBCVGNQPTWIHHRH52VDD4PE64JGFPREF7GVFIIF7G4DZOWKX7Z";
+    const invalid = "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5"; // G-key, not a contract
+
+    await withEnv({ SCHOLARSHIP_ESCROW_CONTRACT_ID: validContract }, async () => {
+      const res = await request(app).get("/.well-known/stellar.toml");
+      const doc = TOML.parse(res.text);
+      expect(doc.SCHOLARSHIP_ESCROW_CONTRACT).toBe(validContract);
+    });
+
+    await withEnv({ SCHOLARSHIP_ESCROW_CONTRACT_ID: invalid }, async () => {
+      const res = await request(app).get("/.well-known/stellar.toml");
+      const doc = TOML.parse(res.text);
+      expect(doc.SCHOLARSHIP_ESCROW_CONTRACT).toBeUndefined();
+      expect(res.text).toContain('# SCHOLARSHIP_ESCROW_CONTRACT = "C..."');
+    });
+  });
+
+  it("does not publish the legacy giving escrow as a scholarship contract", async () => {
+    await withEnv({ GIVING_ESCROW_CONTRACT_ID: "CBP3UFPBCVGNQPTWIHHRH52VDD4PE64JGFPREF7GVFIIF7G4DZOWKX7Z" }, async () => {
+      const res = await request(app).get("/.well-known/stellar.toml");
+      const doc = TOML.parse(res.text);
+      expect(doc.SCHOLARSHIP_ESCROW_CONTRACT).toBeUndefined();
+    });
+  });
+
   it("does not require authentication", async () => {
     const res = await request(app).get("/.well-known/stellar.toml");
     expect(res.statusCode).not.toBe(401);
