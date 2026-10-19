@@ -10,18 +10,28 @@ import {
   buildSep7Uri,
   calculateFeeSplit,
   preflightPayment,
+  PREFLIGHT_REASON_CODES,
   submitTransaction,
   verifyTransaction,
   verifyPaymentOperations,
+  validateSignedPaymentXdr,
   findPaymentPaths,
   applySlippage,
   NETWORK,
+  networkPassphrase,
   getExplorerUrl,
   USDC,
   PLATFORM_WALLET_PUBLIC_KEY,
 } from "../../services/stellar/stellarService.js";
 import { getAssetConfig, isAssetSupported, getSupportedCodes } from "../../config/assets.js";
 import * as StellarSdk from "@stellar/stellar-sdk";
+import {
+  isFeeSponsorEnabled,
+  prepareSponsoredSubmission,
+  recordSponsorshipSpend,
+  getSponsorshipStatus,
+  SponsorshipError,
+} from "../../services/stellar/feeSponsorService.js";
 import { recordSaleEarnings } from "../../services/payoutService.js";
 import { grantItemAccess } from "../../services/stellar/reconciliationService.js";
 import { enqueue } from "../../jobs/queue.js";
@@ -31,7 +41,13 @@ import {
   paymentsSubmitted,
   paymentsConfirmed,
   paymentsFailed,
+  sponsorshipsApproved,
+  sponsorshipsRejected,
 } from "../../config/metrics.js";
+import { recordAudit } from "../../services/audit/auditService.js";
+import { AUDIT_ACTIONS } from "../../models/AuditLog.js";
+import { emitEvent, EVENT_TYPES } from "../../services/webhooks/webhookService.js";
+import { ERROR_CODES, buildErrorResponse } from "../../config/errorCodes.js";
 
 /**
  * Resolve the item, its creator, and the settlement destination wallet for a
@@ -56,6 +72,9 @@ const resolvePaymentDestination = async ({ itemType, itemId, session }) => {
         error: {
           status: 400,
           message: "Creator has not connected their Stellar wallet yet",
+          // The buyer can still complete the purchase through the
+          // claimable-balance (gift) path instead of dead-ending.
+          fallback: "claimable_balance",
         },
       };
     }
@@ -108,42 +127,37 @@ export const getQuote = async (req, res) => {
     const { itemType, itemId, sendAssetCode, sendAssetIssuer } = req.body;
 
     if (!["book", "course"].includes(itemType)) {
-      return res.status(400).json({
-        success: false,
-        message: "Invalid item type. Must be 'book' or 'course'",
-      });
+      return res.status(400).json(
+        buildErrorResponse(ERROR_CODES.VALIDATION_ERROR, "Invalid item type. Must be 'book' or 'course'")
+      );
     }
 
     const Model = itemType === "book" ? Book : Course;
     const item = await Model.findById(itemId);
 
     if (!item) {
-      return res.status(404).json({
-        success: false,
-        message: `${itemType} not found`,
-      });
+      return res.status(404).json(
+        buildErrorResponse(ERROR_CODES.NOT_FOUND, `${itemType} not found`)
+      );
     }
 
     if (!item.price || item.price === 0) {
-      return res.status(400).json({
-        success: false,
-        message: "This item is free, no quote needed",
-      });
+      return res.status(400).json(
+        buildErrorResponse(ERROR_CODES.VALIDATION_ERROR, "This item is free, no quote needed")
+      );
     }
 
     const itemAssetCode = resolveItemCurrency(item);
     if (itemAssetCode !== "USDC") {
-      return res.status(400).json({
-        success: false,
-        message: `Path payment quotes are only available for USDC-priced items. This item is priced in ${itemAssetCode}; pay directly in ${itemAssetCode} instead.`,
-      });
+      return res.status(400).json(
+        buildErrorResponse(ERROR_CODES.VALIDATION_ERROR, `Path payment quotes are only available for USDC-priced items. This item is priced in ${itemAssetCode}; pay directly in ${itemAssetCode} instead.`)
+      );
     }
 
     if (sendAssetCode && !sendAssetIssuer && sendAssetCode !== "XLM" && sendAssetCode !== "native") {
-      return res.status(400).json({
-        success: false,
-        message: "Non-native assets require an issuer. Omit sendAssetIssuer only for native XLM.",
-      });
+      return res.status(400).json(
+        buildErrorResponse(ERROR_CODES.VALIDATION_ERROR, "Non-native assets require an issuer. Omit sendAssetIssuer only for native XLM.")
+      );
     }
 
     const sendAsset = sendAssetIssuer
@@ -154,10 +168,9 @@ export const getQuote = async (req, res) => {
     const paths = await findPaymentPaths(sendAsset, destAmount);
 
     if (!paths || paths.length === 0) {
-      return res.status(404).json({
-        success: false,
-        message: "No payment path found for the given asset",
-      });
+      return res.status(404).json(
+        buildErrorResponse(ERROR_CODES.NOT_FOUND, "No payment path found for the given asset")
+      );
     }
 
     const bestPath = paths[0];
@@ -205,16 +218,13 @@ export const getQuote = async (req, res) => {
       error.message?.includes("Invalid asset") ||
       error.message?.includes("bad asset")
     ) {
-      return res.status(400).json({
-        success: false,
-        message: "Unknown or invalid asset",
-      });
+      return res.status(400).json(
+        buildErrorResponse(ERROR_CODES.VALIDATION_ERROR, "Unknown or invalid asset")
+      );
     }
-    res.status(500).json({
-      success: false,
-      message: "Failed to get quote",
-      error: process.env.NODE_ENV === "development" ? error.message : undefined,
-    });
+    res.status(500).json(
+      buildErrorResponse(ERROR_CODES.INTERNAL_ERROR, "Failed to get quote")
+    );
   }
 };
 
@@ -249,6 +259,7 @@ export const getPaymentPreflight = async (req, res) => {
       return res.status(resolved.error.status).json({
         success: false,
         message: resolved.error.message,
+        ...(resolved.error.fallback && { fallback: resolved.error.fallback }),
       });
     }
 
@@ -282,18 +293,23 @@ export const getPaymentPreflight = async (req, res) => {
       assetCode,
     });
 
+    // A destination without the asset trustline is exactly the case the
+    // claimable-balance (gift) path fixes — surface it so the frontend can
+    // route the buyer there instead of dead-ending on op_no_trust.
+    const hasNoTrustline = preflight.reasons?.some(
+      (r) => r.code === PREFLIGHT_REASON_CODES.DESTINATION_NO_TRUSTLINE
+    );
+
     res.status(200).json({
       success: true,
       preflight,
+      ...(hasNoTrustline && { fallback: "claimable_balance" }),
     });
   } catch (error) {
     logger.error("Payment preflight error:", error);
-    res.status(500).json({
-      success: false,
-      message: "Failed to run payment pre-flight checks",
-      error:
-        process.env.NODE_ENV === "development" ? error.message : undefined,
-    });
+    res.status(500).json(
+      buildErrorResponse(ERROR_CODES.INTERNAL_ERROR, "Failed to run payment pre-flight checks")
+    );
   }
 };
 
@@ -311,35 +327,33 @@ export const initializePayment = async (req, res) => {
 
     if (!["book", "course"].includes(itemType)) {
       await session.abortTransaction();
-      return res.status(400).json({
-        success: false,
-        message: "Invalid item type. Must be 'book' or 'course'",
-      });
+      return res.status(400).json(
+        buildErrorResponse(ERROR_CODES.VALIDATION_ERROR, "Invalid item type. Must be 'book' or 'course'")
+      );
     }
 
     const buyer = await User.findById(buyerId).session(session);
     if (!buyer?.stellarWallet?.publicKey) {
       await session.abortTransaction();
-      return res.status(400).json({
-        success: false,
-        message: "Please connect your Stellar wallet first",
-      });
+      return res.status(400).json(
+        buildErrorResponse(ERROR_CODES.WALLET_NOT_CONNECTED, "Please connect your Stellar wallet first")
+      );
     }
 
     if (buyer.stellarWallet.publicKey !== buyerWallet) {
       await session.abortTransaction();
-      return res.status(400).json({
-        success: false,
-        message: "Wallet mismatch. Please reconnect your wallet.",
-      });
+      return res.status(400).json(
+        buildErrorResponse(ERROR_CODES.WALLET_MISMATCH, "Wallet mismatch. Please reconnect your wallet.")
+      );
     }
 
     const resolved = await resolvePaymentDestination({ itemType, itemId, session });
     if (resolved.error) {
       await session.abortTransaction();
+      const code = resolved.error.status === 404 ? ERROR_CODES.ITEM_NOT_FOUND : ERROR_CODES.VALIDATION_ERROR;
       return res.status(resolved.error.status).json({
-        success: false,
-        message: resolved.error.message,
+        ...buildErrorResponse(code, resolved.error.message),
+        ...(resolved.error.fallback && { fallback: resolved.error.fallback }),
       });
     }
 
@@ -347,19 +361,17 @@ export const initializePayment = async (req, res) => {
 
     if (!item.price || item.price === 0) {
       await session.abortTransaction();
-      return res.status(400).json({
-        success: false,
-        message: "This item is free, no payment required",
-      });
+      return res.status(400).json(
+        buildErrorResponse(ERROR_CODES.VALIDATION_ERROR, "This item is free, no payment required")
+      );
     }
 
     const itemAssetCode = resolveItemCurrency(item);
     if (!isAssetSupported(itemAssetCode)) {
       await session.abortTransaction();
-      return res.status(400).json({
-        success: false,
-        message: `This item is priced in an unsupported asset (${itemAssetCode}). Supported: ${getSupportedCodes().join(", ")}`,
-      });
+      return res.status(400).json(
+        buildErrorResponse(ERROR_CODES.VALIDATION_ERROR, `This item is priced in an unsupported asset (${itemAssetCode}). Supported: ${getSupportedCodes().join(", ")}`)
+      );
     }
 
     const purchasedArray =
@@ -371,10 +383,9 @@ export const initializePayment = async (req, res) => {
 
     if (alreadyPurchased) {
       await session.abortTransaction();
-      return res.status(400).json({
-        success: false,
-        message: `You already own this ${itemType}`,
-      });
+      return res.status(400).json(
+        buildErrorResponse(ERROR_CODES.ALREADY_PURCHASED, `You already own this ${itemType}`)
+      );
     }
 
     const existingTx = await Transaction.findOne({
@@ -385,11 +396,26 @@ export const initializePayment = async (req, res) => {
     }).session(session);
 
     if (existingTx) {
+      // Idempotent initialize: a double-click or client retry while a
+      // pending checkout already exists must not pile up duplicate pending
+      // records. Return the existing record (with its original unsigned XDR
+      // when one was persisted) so the frontend can resume the same
+      // checkout; stale pending records are reaped by the TTL index on
+      // `expiresAt` (pending-only partial index).
       await session.abortTransaction();
-      return res.status(400).json({
-        success: false,
-        message: "You have a pending transaction for this item",
+      return res.status(200).json({
+        success: true,
+        alreadyPending: true,
         transactionId: existingTx._id,
+        message:
+          "You already have a pending transaction for this item; returning it",
+        payment: existingTx.unsignedXdr
+          ? {
+              xdr: existingTx.unsignedXdr,
+              networkPassphrase,
+              expectedHash: existingTx.expectedHash,
+            }
+          : null,
       });
     }
 
@@ -497,7 +523,9 @@ export const initializePayment = async (req, res) => {
       network: NETWORK,
       status: "pending",
       settlement: settlementMode,
-      stellarTxHash: paymentTx.hash,
+      expectedHash: paymentTx.hash,
+      unsignedXdr: paymentTx.xdr,
+      memo,
       ...(sendAssetInput && {
         sendAsset: sendAssetInput,
         sendMax,
@@ -519,6 +547,38 @@ export const initializePayment = async (req, res) => {
     logger.info(
       `Payment initialized: ${transaction._id} for ${itemType} ${itemId}`
     );
+
+    recordAudit({
+      action:     AUDIT_ACTIONS.PAYMENT_INITIALIZE,
+      actor:      buyerId,
+      req,
+      targetType: "Transaction",
+      targetId:   transaction._id.toString(),
+      status:     "success",
+      metadata:   {
+        transactionId:  transaction._id.toString(),
+        itemType,
+        itemId,
+        itemTitle:      item.title,
+        amount:         item.price.toString(),
+        settlementMode,
+      },
+    });
+
+    // Fire-and-forget: emit AFTER the txn has committed (never inside it).
+    await emitEvent(EVENT_TYPES.PAYMENT_INITIALIZED, {
+      transactionId: transaction._id.toString(),
+      itemType,
+      itemId: itemId.toString(),
+      itemTitle: item.title,
+      amount: transaction.amount,
+      currency: transaction.currency,
+      network: transaction.network,
+      settlement: settlementMode,
+      buyerId: buyerId.toString(),
+      creatorId: creator._id.toString(),
+      status: "pending",
+    });
 
     res.status(200).json({
       success: true,
@@ -546,12 +606,9 @@ export const initializePayment = async (req, res) => {
   } catch (error) {
     await session.abortTransaction();
     logger.error("Initialize payment error:", error);
-    res.status(500).json({
-      success: false,
-      message: "Failed to initialize payment",
-      error:
-        process.env.NODE_ENV === "development" ? error.message : undefined,
-    });
+    res.status(500).json(
+      buildErrorResponse(ERROR_CODES.INTERNAL_ERROR, "Failed to initialize payment")
+    );
   } finally {
     session.endSession();
   }
@@ -566,15 +623,62 @@ export const submitPayment = async (req, res) => {
   session.startTransaction();
 
   try {
-    const { transactionId, signedXdr } = req.body;
+    const { transactionId, signedXdr, requestSponsorship } = req.body;
     const buyerId = req.user._id;
 
     if (!transactionId || !signedXdr) {
       await session.abortTransaction();
-      return res.status(400).json({
-        success: false,
-        message: "Transaction ID and signed XDR are required",
-      });
+      return res.status(400).json(
+        buildErrorResponse(ERROR_CODES.VALIDATION_ERROR, "Transaction ID and signed XDR are required")
+      );
+    }
+
+    // Derive the deterministic on-chain hash of the submitted transaction.
+    // A replayed submission of the same signed XDR produces the same hash,
+    // which is what makes submit naturally idempotent per transaction hash.
+    // Parse failures are deliberately ignored here — the XDR is validated in
+    // full below (validateSignedPaymentXdr), which keeps the error shape for
+    // malformed XDRs unchanged.
+    let signedTx = null;
+    try {
+      signedTx = StellarSdk.TransactionBuilder.fromXDR(
+        signedXdr,
+        networkPassphrase
+      );
+    } catch {
+      // fall through — validation below reports the malformed XDR
+    }
+    const signedTxHash = signedTx?.hash().toString("hex") || null;
+
+    // Idempotent submit: if this exact on-chain transaction hash was already
+    // processed (access granted, earnings recorded, receipt queued), return
+    // the original success response instead of re-processing — a double-click
+    // or a client retry after a timeout must never grant access twice. The
+    // unique index on stellarTxHash is the database-level backstop for the
+    // concurrent case (handled below on E11000).
+    if (signedTxHash) {
+      const alreadyProcessed = await Transaction.findOne({
+        buyer: buyerId,
+        stellarTxHash: signedTxHash,
+        status: "confirmed",
+      }).session(session);
+
+      if (alreadyProcessed?.status === "confirmed") {
+        await session.commitTransaction();
+        return res.status(200).json({
+          success: true,
+          replay: true,
+          message: "Payment already processed",
+          transaction: {
+            id: alreadyProcessed._id,
+            hash: alreadyProcessed.stellarTxHash,
+            ledger: alreadyProcessed.stellarLedger,
+            itemTitle: alreadyProcessed.itemTitle,
+            amount: alreadyProcessed.amount,
+            explorerUrl: getExplorerUrl(alreadyProcessed.stellarTxHash),
+          },
+        });
+      }
     }
 
     const transaction = await Transaction.findOne({
@@ -585,36 +689,12 @@ export const submitPayment = async (req, res) => {
 
     if (!transaction) {
       await session.abortTransaction();
-      return res.status(404).json({
-        success: false,
-        message: "Transaction not found or already processed",
-      });
+      return res.status(404).json(
+        buildErrorResponse(ERROR_CODES.NOT_FOUND, "Transaction not found or already processed")
+      );
     }
 
-    transaction.status = "submitted";
-    transaction.submittedAt = new Date();
-    await transaction.save({ session });
-    paymentsSubmitted.inc({ type: "purchase" });
-
-    let result;
-    try {
-      result = await submitTransaction(signedXdr);
-    } catch (stellarError) {
-      transaction.status = "failed";
-      transaction.failureReason = stellarError.message;
-      await transaction.save({ session });
-      await session.commitTransaction();
-      paymentsFailed.inc({ type: "purchase", reason: "stellar_error" });
-
-      logger.error(`Transaction ${transactionId} failed:`, stellarError);
-
-      return res.status(400).json({
-        success: false,
-        message: "Transaction failed on Stellar network",
-        error: stellarError.message,
-      });
-    }
-
+    // Build expected payments to validate XDR BEFORE submit
     const expectedPayments = transaction.platformFee?.platformAmount
       ? [
           {
@@ -633,14 +713,168 @@ export const submitPayment = async (req, res) => {
           },
         ];
 
+    // Fee-bump sponsorship (#30): only when the client opts in AND the master
+    // switch is on. With the flag off this is skipped entirely and the flow
+    // below is byte-for-byte the original unsponsored path.
+    const wantSponsor = requestSponsorship === true && isFeeSponsorEnabled();
+    let submissionXdr = signedXdr;
+    let sponsorship = null;
+
+    if (wantSponsor) {
+      try {
+        // Structural whitelist + spend caps + fee-bump wrapping. This is a
+        // strict superset of validateSignedPaymentXdr, so it is not run again
+        // for the sponsored path.
+        sponsorship = await prepareSponsoredSubmission({
+          signedXdr,
+          transactionRow: transaction,
+          userId: buyerId,
+          session,
+        });
+        submissionXdr = sponsorship.feeBumpXdr;
+      } catch (sponsorError) {
+        if (sponsorError instanceof SponsorshipError) {
+          // Sponsorship-specific failure: DO NOT mark the row failed. Leave it
+          // pending so the client can retry unsponsored (user pays the fee).
+          await session.abortTransaction();
+          sponsorshipsRejected.inc({
+            type: "purchase",
+            reason: sponsorError.code,
+          });
+          logger.info(
+            `Sponsorship rejected for transaction ${transactionId}: ${sponsorError.code}`
+          );
+          return res.status(sponsorError.httpStatus).json({
+            success: false,
+            message: "Fee sponsorship was not applied; retry without sponsorship",
+            sponsorship: { approved: false, reason: sponsorError.code },
+            retryUnsponsored: true,
+          });
+        }
+        throw sponsorError;
+      }
+      sponsorshipsApproved.inc({ type: "purchase" });
+      logger.info(`Sponsorship approved for transaction ${transactionId}`);
+    } else {
+      // Validate signed XDR contents (memo, payments, optional source)
+      try {
+        validateSignedPaymentXdr(
+          signedXdr,
+          expectedPayments,
+          transaction.memo,
+          transaction.buyerWallet,
+          true
+        );
+      } catch (validationError) {
+        transaction.status = "failed";
+        transaction.expiresAt = undefined;
+        transaction.failureReason = `validation_failed: ${validationError.message}`;
+        await transaction.save({ session });
+        await session.commitTransaction();
+        paymentsFailed.inc({ type: "purchase", reason: "validation_failed" });
+
+        logger.error(`Transaction ${transactionId} validation failed:`, validationError.message);
+
+        await emitEvent(EVENT_TYPES.PAYMENT_FAILED, {
+          transactionId: transaction._id.toString(),
+          itemType: transaction.itemType,
+          itemId: transaction.itemId?.toString(),
+          amount: transaction.amount,
+          currency: transaction.currency,
+          network: transaction.network,
+          buyerId: buyerId.toString(),
+          status: "failed",
+          failureReason: `validation_failed: ${validationError.message}`,
+        });
+
+        return res.status(400).json(
+          buildErrorResponse(ERROR_CODES.INVALID_XDR, "Signed transaction does not match expected payment details")
+        );
+      }
+    }
+
+    // Update status to submitted after validation
+    transaction.status = "submitted";
+    transaction.submittedAt = new Date();
+    await transaction.save({ session });
+    paymentsSubmitted.inc({ type: "purchase" });
+
+    let result;
+    try {
+      result = await submitTransaction(submissionXdr);
+    } catch (stellarError) {
+      transaction.status = "failed";
+      transaction.expiresAt = undefined;
+      transaction.failureReason = stellarError.message;
+      await transaction.save({ session });
+      await session.commitTransaction();
+      paymentsFailed.inc({ type: "purchase", reason: "stellar_error" });
+
+      logger.error(`Transaction ${transactionId} failed:`, stellarError);
+
+      await emitEvent(EVENT_TYPES.PAYMENT_FAILED, {
+        transactionId: transaction._id.toString(),
+        itemType: transaction.itemType,
+        itemId: transaction.itemId?.toString(),
+        amount: transaction.amount,
+        currency: transaction.currency,
+        network: transaction.network,
+        buyerId: buyerId.toString(),
+        status: "failed",
+        failureReason: stellarError.message,
+      });
+
+      return res.status(400).json(
+        buildErrorResponse(ERROR_CODES.PAYMENT_FAILED, "Transaction failed on Stellar network")
+      );
+    }
+
+    // Sponsored submits: the platform's fee-bump has landed, so account the
+    // spend (with the real fee_charged) and stamp the sponsorship fields. The
+    // inner-transaction hash is what the payment operations verify against and
+    // what matches `expectedHash`; the fee-bump (outer) hash is kept alongside.
+    if (sponsorship) {
+      transaction.sponsored = true;
+      transaction.feeBumpTxHash = sponsorship.outerHash;
+      transaction.sponsorFeeCharged =
+        result.feeCharged != null
+          ? String(result.feeCharged)
+          : String(sponsorship.maxFeeStroops);
+      try {
+        await recordSponsorshipSpend({
+          userId: buyerId,
+          feeStroops:
+            result.feeCharged != null
+              ? Number(result.feeCharged)
+              : sponsorship.maxFeeStroops,
+          session,
+        });
+      } catch (spendErr) {
+        // Accounting must never sink an on-chain-successful payment; a sweep
+        // can reconcile spend later from the sponsored rows.
+        logger.error(
+          `Failed to record sponsorship spend for transaction ${transactionId}:`,
+          spendErr
+        );
+      }
+    }
+
+    // The hash the payment operations settle under: the inner tx for a
+    // sponsored submit, otherwise the submitted tx itself.
+    const settledHash = sponsorship ? sponsorship.innerHash : result.hash;
+
+    // Verify on-chain that the creator (and platform, when a fee was applied)
+    // actually received the expected USDC amounts
+    // (expectedPayments already defined above for pre-submission validation)
+
     const verification = await verifyPaymentOperations(
-      result.hash,
+      settledHash,
       expectedPayments,
       transaction.currency || "USDC"
     );
 
     if (!verification.verified) {
-      transaction.stellarTxHash = result.hash;
+      transaction.stellarTxHash = settledHash;
       if (verification.transient) {
         transaction.status = "retrying";
         transaction.failureReason = verification.reason;
@@ -652,7 +886,7 @@ export const submitPayment = async (req, res) => {
             {
               attempts: 5,
               backoffMs: 1000,
-              idempotencyKey: `verify:${result.hash}`,
+              idempotencyKey: `verify:${settledHash}`,
               session,
             }
           );
@@ -670,11 +904,13 @@ export const submitPayment = async (req, res) => {
           success: true,
           message: "Payment submitted; confirmation is in progress",
           transactionId: transaction._id,
-          txHash: result.hash,
+          txHash: settledHash,
           status: "retrying",
+          ...(sponsorship && { sponsored: true }),
         });
       }
       transaction.status = "failed";
+      transaction.expiresAt = undefined;
       transaction.failureReason = `On-chain verification failed: ${verification.reason}`;
       await transaction.save({ session });
       await session.commitTransaction();
@@ -684,18 +920,79 @@ export const submitPayment = async (req, res) => {
         `Transaction ${transactionId} verification failed: ${verification.reason}`
       );
 
-      return res.status(400).json({
-        success: false,
-        message: "Payment could not be verified on the Stellar network",
-        error: verification.reason,
+      recordAudit({
+        action:     AUDIT_ACTIONS.PAYMENT_SUBMIT_FAILED,
+        actor:      buyerId,
+        req,
+        targetType: "Transaction",
+        targetId:   transactionId,
+        status:     "failure",
+        metadata:   {
+          transactionId,
+          stellarTxHash: settledHash,
+          failureReason:  `On-chain verification failed: ${verification.reason}`,
+        },
       });
+
+      await emitEvent(EVENT_TYPES.PAYMENT_FAILED, {
+        transactionId: transaction._id.toString(),
+        itemType: transaction.itemType,
+        itemId: transaction.itemId?.toString(),
+        amount: transaction.amount,
+        currency: transaction.currency,
+        network: transaction.network,
+        stellarTxHash: settledHash,
+        buyerId: buyerId.toString(),
+        status: "failed",
+        failureReason: `On-chain verification failed: ${verification.reason}`,
+      });
+
+      return res.status(400).json(
+        buildErrorResponse(ERROR_CODES.PAYMENT_FAILED, "Payment could not be verified on the Stellar network")
+      );
     }
 
-    transaction.stellarTxHash = result.hash;
+    transaction.stellarTxHash = settledHash;
     transaction.stellarLedger = result.ledger;
     transaction.status = "confirmed";
     transaction.confirmedAt = new Date();
-    await transaction.save({ session });
+    transaction.expiresAt = undefined; // terminal state — never TTL-reapable
+    try {
+      await transaction.save({ session });
+    } catch (saveError) {
+      // Idempotency backstop at the database layer: the unique index on
+      // stellarTxHash means a concurrent request already confirmed this exact
+      // on-chain hash. Roll back this session's writes (including the
+      // "submitted" status) and return the original success response.
+      if (saveError?.code === 11000) {
+        const concurrentConfirmed = await Transaction.findOne({
+          buyer: buyerId,
+          stellarTxHash: result.hash,
+          status: "confirmed",
+        }).session(session);
+
+        if (concurrentConfirmed) {
+          await session.abortTransaction();
+          logger.info(
+            `Transaction ${transactionId} already confirmed by a concurrent request (${result.hash}); returning existing result`
+          );
+          return res.status(200).json({
+            success: true,
+            replay: true,
+            message: "Payment already processed",
+            transaction: {
+              id: concurrentConfirmed._id,
+              hash: concurrentConfirmed.stellarTxHash,
+              ledger: concurrentConfirmed.stellarLedger,
+              itemTitle: concurrentConfirmed.itemTitle,
+              amount: concurrentConfirmed.amount,
+              explorerUrl: getExplorerUrl(concurrentConfirmed.stellarTxHash),
+            },
+          });
+        }
+      }
+      throw saveError;
+    }
     paymentsConfirmed.inc({ type: "purchase" });
 
     await recordSaleEarnings(transaction, { session });
@@ -714,7 +1011,7 @@ export const submitPayment = async (req, res) => {
         {
           attempts: 5,
           backoffMs: 1000,
-          idempotencyKey: `receipt:${result.hash}`,
+          idempotencyKey: `receipt:${settledHash}`,
           session,
         }
       );
@@ -730,30 +1027,69 @@ export const submitPayment = async (req, res) => {
     await session.commitTransaction();
 
     logger.info(
-      `Payment successful: ${transactionId}, Stellar TX: ${result.hash}`
+      `Payment successful: ${transactionId}, Stellar TX: ${settledHash}${sponsorship ? " (sponsored)" : ""}`
     );
+
+    recordAudit({
+      action:     AUDIT_ACTIONS.PAYMENT_SUBMIT_CONFIRMED,
+      actor:      buyerId,
+      req,
+      targetType: "Transaction",
+      targetId:   transactionId,
+      status:     "success",
+      metadata:   {
+        transactionId,
+        stellarTxHash:  settledHash,
+        stellarLedger:  result.ledger,
+        amount:         transaction.amount,
+        itemType:       transaction.itemType,
+        itemId:         transaction.itemId?.toString(),
+        settlementMode: transaction.settlement,
+        sponsored:      !!sponsorship,
+      },
+    });
+
+    // Fire-and-forget: emit AFTER the txn commit above.
+    await emitEvent(EVENT_TYPES.PAYMENT_CONFIRMED, {
+      transactionId: transaction._id.toString(),
+      itemType: transaction.itemType,
+      itemId: transaction.itemId?.toString(),
+      itemTitle: transaction.itemTitle,
+      amount: transaction.amount,
+      currency: transaction.currency,
+      network: transaction.network,
+      settlement: transaction.settlement,
+      stellarTxHash: settledHash,
+      stellarLedger: result.ledger,
+      buyerId: buyerId.toString(),
+      creatorId: transaction.creator?.toString(),
+      status: "confirmed",
+      sponsored: !!sponsorship,
+    });
 
     res.status(200).json({
       success: true,
       message: "Payment successful!",
       transaction: {
         id: transaction._id,
-        hash: result.hash,
+        hash: settledHash,
         ledger: result.ledger,
         itemTitle: transaction.itemTitle,
         amount: transaction.amount,
-        explorerUrl: getExplorerUrl(result.hash),
+        explorerUrl: getExplorerUrl(settledHash),
+        ...(sponsorship && {
+          sponsored: true,
+          feeBumpTxHash: sponsorship.outerHash,
+          sponsorFeeCharged: transaction.sponsorFeeCharged,
+        }),
       },
     });
   } catch (error) {
     await session.abortTransaction();
     logger.error("Submit payment error:", error);
-    res.status(500).json({
-      success: false,
-      message: "Failed to process payment",
-      error:
-        process.env.NODE_ENV === "development" ? error.message : undefined,
-    });
+    res.status(500).json(
+      buildErrorResponse(ERROR_CODES.INTERNAL_ERROR, "Failed to process payment")
+    );
   } finally {
     session.endSession();
   }
@@ -822,10 +1158,9 @@ export const getTransaction = async (req, res) => {
       .populate("creator", "name avatar");
 
     if (!transaction) {
-      return res.status(404).json({
-        success: false,
-        message: "Transaction not found",
-      });
+      return res.status(404).json(
+        buildErrorResponse(ERROR_CODES.NOT_FOUND, "Transaction not found")
+      );
     }
 
     let stellarVerification = null;
@@ -878,20 +1213,52 @@ export const cancelTransaction = async (req, res) => {
         status: "pending",
       },
       {
-        status: "expired",
-        failureReason: "Cancelled by user",
+        $set: {
+          status: "expired",
+          failureReason: "Cancelled by user",
+        },
+        $unset: {
+          expiresAt: 1,
+        },
       },
       { new: true }
     );
 
     if (!transaction) {
-      return res.status(404).json({
-        success: false,
-        message: "Transaction not found or cannot be cancelled",
-      });
+      return res.status(404).json(
+        buildErrorResponse(ERROR_CODES.NOT_FOUND, "Transaction not found or cannot be cancelled")
+      );
     }
 
     logger.info(`Transaction ${transactionId} cancelled by user ${userId}`);
+
+    recordAudit({
+      action:     AUDIT_ACTIONS.PAYMENT_CANCEL,
+      actor:      userId,
+      req,
+      targetType: "Transaction",
+      targetId:   transactionId,
+      status:     "success",
+      metadata:   {
+        transactionId,
+        itemType:  transaction.itemType,
+        itemId:    transaction.itemId?.toString(),
+        amount:    transaction.amount,
+        failureReason: "Cancelled by user",
+      },
+    });
+
+    await emitEvent(EVENT_TYPES.PAYMENT_EXPIRED, {
+      transactionId: transaction._id.toString(),
+      itemType: transaction.itemType,
+      itemId: transaction.itemId?.toString(),
+      amount: transaction.amount,
+      currency: transaction.currency,
+      network: transaction.network,
+      buyerId: userId.toString(),
+      status: "expired",
+      failureReason: "Cancelled by user",
+    });
 
     res.status(200).json({
       success: true,
@@ -899,9 +1266,27 @@ export const cancelTransaction = async (req, res) => {
     });
   } catch (error) {
     logger.error("Cancel transaction error:", error);
-    res.status(500).json({
-      success: false,
-      message: "Failed to cancel transaction",
-    });
+    res.status(500).json(
+      buildErrorResponse(ERROR_CODES.INTERNAL_ERROR, "Failed to cancel transaction")
+    );
+  }
+};
+
+/**
+ * Fee-bump sponsorship status (#30) — auth-protected ops view. Exposes whether
+ * sponsorship is enabled, the sponsor account's public key and live XLM float,
+ * the configured caps, and today's spend so the float can be topped up before
+ * it runs dry. The sponsor secret is never read here and never returned.
+ * GET /api/stellar/payment/sponsorship/status
+ */
+export const sponsorshipStatus = async (req, res) => {
+  try {
+    const status = await getSponsorshipStatus();
+    res.status(200).json({ success: true, sponsorship: status });
+  } catch (error) {
+    logger.error("Sponsorship status error:", error);
+    res.status(500).json(
+      buildErrorResponse(ERROR_CODES.INTERNAL_ERROR, "Failed to fetch sponsorship status")
+    );
   }
 };

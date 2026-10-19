@@ -14,8 +14,14 @@ import {
   checkIfFollowing,
   getRecommendations,
   getUserStats,
+  getLearningDashboard,
 } from "../controllers/userController.js";
 import { searchAll } from "../controllers/searchController.js";
+import { getUserBadgesController } from "../controllers/badge.controller.js";
+import completionRoutes, {
+  getUserCompletion,
+} from "./api/users/completion.js";
+import preferencesRoutes from "./api/users/preferences.js";
 import {
   cacheMiddleware,
   invalidateCacheMiddleware,
@@ -32,6 +38,10 @@ const followersCacheKey = (req) =>
 const followingCacheKey = (req) =>
   `${CACHE_KEYS.USER}${req.params.userId}:following`;
 
+// User preferences routes (must be before /:id)
+router.use("/me/preferences", preferencesRoutes);
+router.use("/preferences", preferencesRoutes);
+
 // Get personalized recommendations - cached for 10 minutes (must be before /:id)
 router.get(
   "/recommendations",
@@ -47,7 +57,7 @@ router.put(
   "/update/:id",
   protect,
   (req, res, next) => {
-    if (req.user._id.toString() !== req.params.id) {
+    if (req.user.role !== "admin" && req.user._id.toString() !== req.params.id) {
       return res.status(403).json({ success: false, message: "Not authorized to update this profile", data: null });
     }
     next();
@@ -56,6 +66,15 @@ router.put(
   invalidateCacheMiddleware([`${CACHE_KEYS.USER}*`]),
   updateUser
 );
+
+// Profile completion routes (must be before /:id)
+router.use("/completion", completionRoutes);
+
+// Fetch user badges
+router.get("/:userId/badges", protect, getUserBadgesController);
+
+// Fetch user profile completion
+router.get("/:userId/completion", protect, getUserCompletion);
 
 // Get user by ID - cached for 10 minutes
 router.get(
@@ -69,6 +88,12 @@ router.get(
 router.delete(
   "/:id",
   protect,
+  (req, res, next) => {
+    if (req.user.role !== "admin" && req.user._id.toString() !== req.params.id) {
+      return res.status(403).json({ success: false, message: "Not authorized to delete this user", data: null });
+    }
+    next();
+  },
   invalidateCacheMiddleware([`${CACHE_KEYS.USER}*`]),
   deleteUser
 );
@@ -125,5 +150,6 @@ router.get(
   cacheMiddleware(CACHE_TTL.USERS, userStatsCacheKey),
   getUserStats
 );
+router.get("/me/learning", protect, getLearningDashboard);
 
 export default router;
