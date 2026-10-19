@@ -83,4 +83,8 @@ spaceSchema.pre("validate", function (next) {
   next();
 });
 
+spaceSchema.index({ title: "text", description: "text", category: "text" });
+spaceSchema.index({ host: 1 });
+spaceSchema.index({ status: 1, eventDate: 1 });
+
 export default mongoose.model("Space", spaceSchema);

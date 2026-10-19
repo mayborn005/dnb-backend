@@ -26,6 +26,10 @@ const notificationSchema = new mongoose.Schema(
         "system", // System notification
         "welcome", // Welcome notification
         "recommendation", // New recommendation
+        "pledge_due", // Recurring sadaqah cycle ready to sign
+        "course_update", // Course update or announcement
+        "course_announcement",
+        "bulk",
       ],
       required: true,
     },
@@ -55,6 +59,8 @@ const notificationSchema = new mongoose.Schema(
         type: mongoose.Schema.Types.ObjectId,
         ref: "Reel",
       },
+      pledgeId: { type: mongoose.Schema.Types.ObjectId, ref: "Pledge" },
+      pledgeCycleId: { type: mongoose.Schema.Types.ObjectId, ref: "PledgeCycle" },
       commentId: String,
       // Any other relevant data
     },
@@ -74,13 +80,13 @@ const notificationSchema = new mongoose.Schema(
   },
   {
     timestamps: true,
-    // Index for efficient queries
-    indexes: [
-      { recipient: 1, createdAt: -1 },
-      { recipient: 1, isRead: 1 },
-      { recipient: 1, isDeleted: 1 },
-    ],
   }
 );
+
+// Indexes for efficient querying
+notificationSchema.index({ recipient: 1, createdAt: -1 });
+notificationSchema.index({ recipient: 1, isRead: 1 });
+notificationSchema.index({ recipient: 1, isDeleted: 1 });
+notificationSchema.index({ recipient: 1, isDeleted: 1, createdAt: -1 });
 
 export default mongoose.model("Notification", notificationSchema);

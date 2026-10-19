@@ -1,6 +1,11 @@
 import mongoose from "mongoose";
 import Reel from "../models/Reel.js";
 import cloudinary from "../utils/cloudinary.js";
+import logger from "../config/logger.js";
+import {
+  createReelDerivative,
+  listReelDerivatives,
+} from "../services/reelDuetService.js";
 
 const uploadBufferToCloudinary = (buffer, options) =>
   new Promise((resolve, reject) => {
@@ -47,12 +52,18 @@ const formatReelResponse = (reel, viewerId) => {
     duration: reel.duration,
     createdAt: reel.createdAt,
     updatedAt: reel.updatedAt,
+    originalReelId: reel.originalReelId || null,
+    duetType: reel.duetType || null,
+    stitchClip: reel.stitchClip || null,
+    composition: reel.composition || null,
     stats: {
       likes: likeSet.size,
       loves: loveSet.size,
       comments: reel.comments?.length || 0,
       shares: reel.shareCount || 0,
       views: reel.viewCount || 0,
+      duets: reel.duetCount || 0,
+      stitches: reel.stitchCount || 0,
     },
     viewerState: viewerKey
       ? {
@@ -105,7 +116,7 @@ export const getReels = async (req, res) => {
       reels: formatted,
     });
   } catch (error) {
-    console.error("Error fetching reels:", error);
+    logger.error("Error fetching reels:", error);
     res.status(500).json({ success: false, message: error.message });
   }
 };
@@ -129,7 +140,7 @@ export const getReelById = async (req, res) => {
       .status(200)
       .json({ success: true, reel: formatReelResponse(reel, viewerId) });
   } catch (error) {
-    console.error("Error fetching reel:", error);
+    logger.error("Error fetching reel:", error);
     res.status(500).json({ success: false, message: error.message });
   }
 };
@@ -179,7 +190,7 @@ export const createReel = async (req, res) => {
       reel: formatReelResponse(populatedReel.toObject(), userId),
     });
   } catch (error) {
-    console.error("Error creating reel:", error);
+    logger.error("Error creating reel:", error);
     res.status(500).json({ success: false, message: error.message });
   }
 };
@@ -237,7 +248,7 @@ export const reactToReel = async (req, res) => {
       },
     });
   } catch (error) {
-    console.error("Error reacting to reel:", error);
+    logger.error("Error reacting to reel:", error);
     res.status(500).json({ success: false, message: error.message });
   }
 };
@@ -285,7 +296,7 @@ export const addReelComment = async (req, res) => {
       stats: { comments: reel.comments.length },
     });
   } catch (error) {
-    console.error("Error adding reel comment:", error);
+    logger.error("Error adding reel comment:", error);
     res.status(500).json({ success: false, message: error.message });
   }
 };
@@ -327,7 +338,7 @@ export const getReelComments = async (req, res) => {
       comments: paginated,
     });
   } catch (error) {
-    console.error("Error fetching reel comments:", error);
+    logger.error("Error fetching reel comments:", error);
     res.status(500).json({ success: false, message: error.message });
   }
 };
@@ -370,7 +381,7 @@ export const deleteReelComment = async (req, res) => {
       stats: { comments: reel.comments.length },
     });
   } catch (error) {
-    console.error("Error deleting reel comment:", error);
+    logger.error("Error deleting reel comment:", error);
     res.status(500).json({ success: false, message: error.message });
   }
 };
@@ -395,7 +406,7 @@ export const registerReelShare = async (req, res) => {
       shareCount: reel.shareCount,
     });
   } catch (error) {
-    console.error("Error updating reel share count:", error);
+    logger.error("Error updating reel share count:", error);
     res.status(500).json({ success: false, message: error.message });
   }
 };
@@ -420,7 +431,102 @@ export const registerReelView = async (req, res) => {
       viewCount: reel.viewCount,
     });
   } catch (error) {
-    console.error("Error updating reel view count:", error);
+    logger.error("Error updating reel view count:", error);
+    res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+// ======================
+// DUET / STITCH
+// ======================
+
+// Create a duet/stitch response video linked to the original reel (:id).
+// A `duet` is displayed side-by-side with the original; a `stitch` prepends a
+// clip of the original before the response plays.
+export const createReelDuet = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { description, category, tags, type, stitchStart, stitchEnd } =
+      req.body;
+    const userId = req.user?._id;
+
+    if (!req.file?.buffer) {
+      return res
+        .status(400)
+        .json({ success: false, message: "Video file is required" });
+    }
+
+    const uploadResult = await uploadBufferToCloudinary(req.file.buffer, {
+      resource_type: "video",
+      folder: "dnb/reels/duets",
+    });
+
+    const clip =
+      type === "stitch"
+        ? { start: Number(stitchStart), end: Number(stitchEnd) }
+        : undefined;
+
+    const derivative = await createReelDerivative({
+      originalReelId: id,
+      type,
+      userId,
+      description,
+      category,
+      tags: normalizeTags(tags),
+      video: uploadResult.secure_url,
+      videoPublicId: uploadResult.public_id,
+      thumbnail: uploadResult.thumbnail_url || uploadResult.secure_url,
+      duration: uploadResult.duration,
+      clip,
+    });
+
+    const populatedReel = await derivative.populate("createdBy", "name avatar");
+
+    res.status(201).json({
+      success: true,
+      reel: formatReelResponse(populatedReel.toObject(), userId),
+    });
+  } catch (error) {
+    logger.error("Error creating reel duet/stitch:", error);
+    res
+      .status(error.statusCode || 500)
+      .json({ success: false, message: error.message });
+  }
+};
+
+// Browse all duets/stitches for a given reel (:id). Optional ?type=duet|stitch.
+export const getReelDerivatives = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { type } = req.query;
+    const viewerId = req.user?._id;
+
+    const original = await Reel.findById(id).select("_id duetCount stitchCount");
+    if (!original) {
+      return res
+        .status(404)
+        .json({ success: false, message: "Reel not found" });
+    }
+
+    const { items, page, limit, total, hasMore } = await listReelDerivatives(
+      id,
+      { page: req.query.page, limit: req.query.limit, type }
+    );
+
+    res.status(200).json({
+      success: true,
+      page,
+      limit,
+      total,
+      hasMore,
+      counts: {
+        duets: original.duetCount || 0,
+        stitches: original.stitchCount || 0,
+      },
+      reels: items.map((reel) => formatReelResponse(reel, viewerId)),
+    });
+  } catch (error) {
+    logger.error("Error fetching reel duets/stitches:", error);
     res.status(500).json({ success: false, message: error.message });
   }
 };

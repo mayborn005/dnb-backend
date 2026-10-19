@@ -90,14 +90,16 @@ export const updateSpace = async (req, res) => {
       if (req.body[key] !== undefined) updates[key] = req.body[key];
     }
 
+    // Ownership is enforced by authorizeOwnership middleware (req.resource).
+    const existingSpace = req.resource || (await Space.findById(id));
+    if (!existingSpace) {
+      return res.status(404).json({ success: false, message: "Space not found" });
+    }
+
     const space = await Space.findByIdAndUpdate(id, updates, {
       new: true,
     }).populate("host", "name email avatar");
 
-    if (!space)
-      return res
-        .status(404)
-        .json({ success: false, message: "Space not found" });
     res.status(200).json({ success: true, space });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
@@ -150,11 +152,13 @@ export const getSpacesByHost = async (req, res) => {
 export const deleteSpace = async (req, res) => {
   try {
     const { id } = req.params;
-    const space = await Space.findByIdAndDelete(id);
-    if (!space)
-      return res
-        .status(404)
-        .json({ success: false, message: "Space not found" });
+    // Ownership is enforced by authorizeOwnership middleware (req.resource).
+    const space = req.resource || (await Space.findById(id));
+    if (!space) {
+      return res.status(404).json({ success: false, message: "Space not found" });
+    }
+
+    await Space.findByIdAndDelete(id);
     res.status(200).json({ success: true, message: "Space deleted" });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });

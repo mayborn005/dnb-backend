@@ -1,95 +1,42 @@
-import Course from "../models/Course.js";
-import Book from "../models/Book.js";
-import User from "../models/User.js";
-import Space from "../models/Space.js";
-import Reel from "../models/Reel.js";
-import mongoose from "mongoose";
+import { searchCollections, searchEducators } from "../services/search/searchService.js";
+import logger from "../config/logger.js";
+import { ERROR_CODES, buildErrorResponse } from "../config/errorCodes.js";
 
 export const searchAll = async (req, res) => {
   try {
-    const { q } = req.query;
-    if (!q || q.trim() === "") {
-      return res.status(400).json({ error: "Query string is required." });
+    const { q, type = "all", page = 1, limit = 20, sort, cursor, minPrice, maxPrice, free, category, minRating, interest } = req.query;
+    
+    if (q && q.trim().length > 100) {
+      return res.status(400).json(buildErrorResponse(ERROR_CODES.VALIDATION_ERROR, "Query string is too long."));
     }
-    const queryRegex = new RegExp(q.trim(), "i");
-    console.log("Search query:", q);
 
-
-    // Search Courses
-    const courses = await Course.find({ title: queryRegex })
-      .select("_id title description  price thumbnail")
-      .lean();
-    console.log("Courses found:", courses);
-    // Search Books
-    const books = await Book.find({ title: queryRegex })
-      .select("_id title description  price image author")
-      .lean();
-    console.log("Books found:", books);
-    // Search Users
-    const users = await User.find({ name: queryRegex })
-      .select("_id name email avatar role ")
-      .lean();
-    console.log("Users found:", users);
-    // Search Spaces
-    const spaces = await Space.find({ title: queryRegex })
-      .select(
-        "_id title description  price status eventDate duration host"
-      )
-      .lean();
-    console.log("Spaces found:", spaces);
-    // Search Reels (by description)
-    const reels = await Reel.find({ description: queryRegex })
-      .select("_id description createdBy")
-      .lean();
-    console.log("Reels found:", reels);
-
-    const results = [
-      ...courses.map((c) => ({
-        type: "course",
-        id: c._id,
-        title: c.title,
-        description: c.description,
-        price: c.price,
-        thumbnail: c.thumbnail,
-      })),
-      ...books.map((b) => ({
-        type: "book",
-        id: b._id,
-        title: b.title,
-        description: b.description,
-        category: b.category,
-        price: b.price,
-        image: b.image,
-        author: b.author,
-      })),
-      ...users.map((u) => ({
-        type: "user",
-        id: u._id,
-        name: u.name,
-        avatar: u.avatar,
-        role: u.role,
-      })),
-      ...spaces.map((s) => ({
-        type: "space",
-        id: s._id,
-        title: s.title,
-        description: s.description,
-        price: s.price,
-        status: s.status,
-        eventDate: s.eventDate,
-        duration: s.duration,
-        host: s.host,
-      })),
-      ...reels.map((r) => ({
-        type: "reel",
-        id: r._id,
-        description: r.description,
-      })),
-    ];
-
-    res.json(results);
+    const filters = { minPrice, maxPrice, free, category, minRating, interest };
+    
+    const result = await searchCollections({ q: q ? q.trim() : "", type, page, limit, sort, cursor, filters });
+    
+    res.status(200).json({ success: true, data: result.results, pagination: result.pagination });
   } catch (err) {
-    console.error("Search error:", err);
-    res.status(500).json({ error: "Server error", details: err.message });
+    logger.error("Search error:", err);
+    const code = err.statusCode ? (err.statusCode === 404 ? ERROR_CODES.NOT_FOUND : ERROR_CODES.VALIDATION_ERROR) : ERROR_CODES.INTERNAL_ERROR;
+    res.status(err.statusCode || 500).json(
+      buildErrorResponse(code, err.statusCode ? err.message : "Server error")
+    );
+  }
+};
+
+export const searchEducatorsHandler = async (req, res) => {
+  try {
+    const { q, interest, page = 1, limit = 20, cursor } = req.query;
+    
+    if (q && q.trim().length > 100) {
+      return res.status(400).json(buildErrorResponse(ERROR_CODES.VALIDATION_ERROR, "Query string is too long."));
+    }
+    
+    const result = await searchEducators({ q: q ? q.trim() : "", interest, page, limit, cursor });
+    
+    res.status(200).json({ success: true, data: result.results, pagination: result.pagination });
+  } catch (err) {
+    logger.error("Search educators error:", err);
+    res.status(500).json(buildErrorResponse(ERROR_CODES.INTERNAL_ERROR, "Server error"));
   }
 };
